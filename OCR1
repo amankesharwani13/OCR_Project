@@ -1,0 +1,167 @@
+# import os
+# import time
+# import logging
+# from dotenv import load_dotenv
+# from azure.core.credentials import AzureKeyCredential # wrapper for azure api authentication
+# from azure.ai.documentintelligence import DocumentIntelligenceClient 
+
+# load_dotenv()
+
+# # Logging Configuration
+# logging.basicConfig(
+#     level=logging.INFO,
+#     format="%(asctime)s - %(levelname)s - %(message)s"
+# )
+
+# logger = logging.getLogger(__name__)
+
+
+# class AzureOCRProcessor:
+#     # ALLOWED_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".pdf")
+#     MAX_FILE_SIZE_MB = 10 # large file - memory issue/api fail
+
+#     def __init__(self, endpoint: str, api_key: str):
+#         try:
+#             if not endpoint or not api_key:
+#                 raise ValueError("Endpoint or API key is missing.")
+
+#             self.client = DocumentIntelligenceClient( # azure client create
+#                 endpoint=endpoint,
+#                 credential=AzureKeyCredential(api_key)
+#             )
+
+#             logger.info("Azure OCR Processor initialized successfully.")
+
+#         except Exception as e:
+#             logger.error(f"Error initializing Azure OCR Processor: {e}")
+#             raise
+
+#     # File Validation
+#     # def _validate_file(self, image_path: str):
+#     #     if not os.path.exists(image_path):
+#     #         raise FileNotFoundError(f"Image not found: {image_path}")
+
+#     #     # if not image_path.lower().endswith(self.ALLOWED_EXTENSIONS):
+#     #     #     raise ValueError("Unsupported file format.")
+
+#     #     file_size = os.path.getsize(image_path) / (1024 * 1024)
+#     #     if file_size > self.MAX_FILE_SIZE_MB:
+#     #         raise ValueError(f"File too large: {file_size:.2f} MB")
+
+#     # Retry Logic with Backoff - handle API failures, network issue, azure down
+#     def _retry_analyze(self, image_bytes, retries=3, delay=2):
+#         for attempt in range(retries):
+#             try:
+#                 logger.info(f"Attempt {attempt+1}")
+
+#                 poller = self.client.begin_analyze_document(
+#                     "prebuilt-layout", # prebuilt-read - Normal OCR (text extraction), prebuilt-layout - Layout + tables, prebuilt-invoice - Invoice parsing
+#                     image_bytes
+#                 )
+#                 print("Length -----", len(poller.result().pages)) # debug
+
+#                 return poller.result(timeout=30)
+
+#             except Exception as e:
+#                 logger.warning(f"Attempt {attempt+1} failed: {e}")
+
+#                 if attempt < retries - 1:
+#                     sleep_time = delay * (2 ** attempt) # Exponential Backoff
+#                     logger.info(f"Sleeping for {sleep_time} sec")
+#                     time.sleep(sleep_time)
+#                 else:
+#                     logger.error("All retry attempts failed.")
+#                     raise
+
+#     # Parse Azure Response
+#     def _parse_result(self, result) -> str: # Not neccessary
+#         if not result or not result.pages:
+#             logger.warning("No pages returned from Azure OCR.")
+#             return ""
+
+#         extracted_text = []
+
+#         for page in result.pages:
+#             if not page.lines: # skip empty page
+#                 continue
+
+#             for line in page.lines:
+#                 if line.content:
+#                     extracted_text.append(line.content)
+
+#         final_text = "\n".join(extracted_text).strip()
+
+#         if not final_text:
+#             logger.warning("No text detected in image.")
+
+#         return final_text
+
+#     # Main OCR Method
+#     def extract_text(self, image_path: str) -> str:
+#         try:
+#             logger.info(f"Processing started | file={image_path}")
+
+#             # Validate file
+#             # self._validate_file(image_path)
+
+#             # Read image
+#             with open(image_path, "rb") as f:
+#                 image_bytes = f.read()
+
+#             # Call Azure OCR with retry
+#             result = self._retry_analyze(image_bytes)
+#             # print("Result:", result) # debug
+#             # print("Result Content", result.content) # debug
+           
+
+#             # Parse result
+#             final_text = self._parse_result(result)
+
+#             if final_text:
+#                 logger.info("Text extraction successful.")
+#             return final_text
+
+#         except FileNotFoundError as e:
+#             logger.error(f"[FILE ERROR] {e}")
+#             return ""
+
+#         except ValueError as e:
+#             logger.error(f"[VALIDATION ERROR] {e}")
+#             return ""
+
+#         except Exception as e:
+#             logger.error(f"[OCR ERROR] Unexpected error: {e}")
+#             return ""
+
+#         finally:
+#             logger.info("[OCR] Processing completed.")
+
+
+# # Main Execution
+# if __name__ == "__main__":
+#     try:
+#         AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT")
+#         AZURE_API_KEY = os.getenv("AZURE_API_KEY")
+
+#         # Fail fast
+#         if not AZURE_ENDPOINT or not AZURE_API_KEY:
+#             raise EnvironmentError("Missing Azure credentials in .env")
+
+#         ocr = AzureOCRProcessor(AZURE_ENDPOINT, AZURE_API_KEY)
+
+#         image_path = input("Enter image path: ").strip()
+
+#         extracted_text = ocr.extract_text(image_path)
+        
+
+#         print("\n===== Extracted Text =====\n")
+#         print(extracted_text if extracted_text else "No text found.")
+
+#     except Exception as e:
+#         logger.critical(f"[FATAL] Application failed: {e}")
+
+
+
+
+
+
