@@ -1,0 +1,381 @@
+import os
+import time
+import logging
+import re
+from dotenv import load_dotenv
+from azure.core.credentials import AzureKeyCredential # wrapper for azure api authentication
+from azure.ai.documentintelligence import DocumentIntelligenceClient
+
+from PIL import Image
+import cv2
+import numpy as np
+
+load_dotenv()
+
+# Logging Configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+logger = logging.getLogger(__name__)
+
+
+class AzureOCRProcessor:
+    ALLOWED_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".pdf")
+    MAX_FILE_SIZE_MB = 10 # large file - memory issue/api fail
+
+    def __init__(self, endpoint: str, api_key: str):
+        try:
+            if not endpoint or not api_key:
+                raise ValueError("Endpoint or API key is missing.")
+
+            self.client = DocumentIntelligenceClient(
+                endpoint=endpoint,
+                credential=AzureKeyCredential(api_key)
+            )
+
+            logger.info("Azure OCR Processor initialized successfully.")
+
+        except Exception as e:
+            logger.error(f"Initialization error: {e}")
+            raise
+
+    # File Validation
+    def _validate_file(self, image_path: str):
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Image not found: {image_path}")
+
+        if not image_path.lower().endswith(self.ALLOWED_EXTENSIONS):
+            raise ValueError("Unsupported file format.")
+
+        size = os.path.getsize(image_path) / (1024 * 1024)
+        if size > self.MAX_FILE_SIZE_MB:
+            raise ValueError(f"File too large: {size:.2f} MB")
+
+
+    # Preprocessing
+    def _preprocess_image(self, image_path: str) -> bytes:
+        start_time = time.time()
+        try:
+            # PDF skip because it degrade the quality of pdf
+            if image_path.lower().endswith(".pdf"):
+                logger.info("[PREPROCESS] PDF → skipping preprocessing")
+                with open(image_path, "rb") as f:
+                    return f.read()
+
+            # 1. LOAD IMAGE (PIL)
+            pil = Image.open(image_path).convert("RGB")
+            dpi = pil.info.get("dpi", (72, 72))[0] # Low DPI means size of text pixel small
+
+            logger.info(f"[META] Size={pil.size}, DPI={dpi}")
+
+            # 2. SCALING
+            MAX_DIM = 3000
+            MIN_DIM = 1500
+
+            max_dim = max(pil.width, pil.height)
+            min_dim = min(pil.width, pil.height)
+
+            # DOWNscale (only if too large)
+            if max_dim > MAX_DIM:
+                scale = MAX_DIM / max_dim
+                pil = pil.resize(
+                    (int(pil.width * scale), int(pil.height * scale)),
+                    Image.LANCZOS
+                )
+                logger.info(f"[PREPROCESS] Downscaled (scale={scale:.2f})")
+
+            # UPscale (only if too small)
+            elif min_dim < MIN_DIM:
+                scale = min(max(MIN_DIM / min_dim, 1.2), 2.5)
+                pil = pil.resize(
+                    (int(pil.width * scale), int(pil.height * scale)),
+                    Image.LANCZOS
+                )
+                logger.info(f"[PREPROCESS] Upscaled (scale={scale:.2f})")
+
+            # Perfect range
+            else:
+                logger.info("[PREPROCESS] Resize skipped (optimal size)")
+
+            # Convert to OpenCV
+            image = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+
+            # 3. GRAYSCALE
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+            # BLANK IMAGE CHECK
+            mean_val = np.mean(gray) # mean - brightness
+            std_val = np.std(gray) # std - contrast
+            white_ratio = np.sum(gray > 240) / gray.size
+
+            if mean_val > 245 and std_val < 10 and white_ratio > 0.98:
+                logger.info("[PREPROCESS] Blank image detected → skipping OCR")
+                return b"" # return empty bytes instead of string
+
+            # 4. CONTRAST ENHANCEMENT (CLAHE)
+            contrast_level = np.std(gray) # contrast measure
+
+            if contrast_level < 40:
+                # Very low contrast → strong CLAHE
+                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                contrast = clahe.apply(gray)
+                logger.info("[PREPROCESS] Strong CLAHE applied")
+
+            elif contrast_level < 70:
+                # Medium contrast → mild CLAHE
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                contrast = clahe.apply(gray)
+                logger.info("[PREPROCESS] Mild CLAHE applied")
+
+            else:
+                # Already good contrast → skip
+                contrast = gray
+                logger.info("[PREPROCESS] CLAHE skipped")
+
+            # 5. NOISE REMOVAL
+            lap_var = cv2.Laplacian(contrast, cv2.CV_64F).var()
+
+            if lap_var < 80: # image blurry, low sharpness
+                # blurry → strong denoise
+                denoised = cv2.fastNlMeansDenoising(contrast, None, h=8)
+                logger.info("[PREPROCESS] Strong denoise (blurry image)")
+            elif lap_var < 150: # medium sharpness
+                # medium → light blur
+                denoised = cv2.GaussianBlur(contrast, (3, 3), 0)
+                logger.info("[PREPROCESS] Light denoise")
+            else:
+                denoised = contrast
+                logger.info("[PREPROCESS] Denoising skipped (already sharp)")
+
+            # 6. SHARPENING - Edges enhancement
+            lap_var1 = cv2.Laplacian(denoised, cv2.CV_64F).var()
+
+            if lap_var1 < 100:
+                kernel = np.array([
+                    [0, -1, 0],
+                    [-1, 5, -1],
+                    [0, -1, 0]
+                ])
+                sharpened = cv2.filter2D(denoised, -1, kernel)
+                logger.info("[PREPROCESS] Sharpening applied (low sharpness)")
+            else:
+                sharpened = denoised
+                logger.info("[PREPROCESS] Sharpening skipped (already sharp)")
+
+            # 7. DESKEW - Rotation Fix
+            edges = cv2.Canny(sharpened, 50, 150) # edge detection algorithm
+
+            coords = np.column_stack(np.where(edges > 0)) # Edge coordinates (x, y)
+
+            if len(coords) > 500:
+                angle = cv2.minAreaRect(coords)[-1] # rotation angle detect
+
+                if angle < -45:
+                    angle = -(90 + angle)
+                else:
+                    angle = -angle
+
+                if abs(angle) > 0.5:
+                    (h, w) = sharpened.shape[:2] # image size
+                    center = (w // 2, h // 2) # center of image
+
+                    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+
+                    sharpened = cv2.warpAffine( # rotate image
+                        sharpened,
+                        M, 
+                        (w, h),
+                        flags=cv2.INTER_CUBIC,
+                        borderMode=cv2.BORDER_REPLICATE
+                    )
+
+                    logger.info(f"[PREPROCESS] Deskew applied: {angle:.2f}°")
+
+            # 8. CONTRAST-BASED THRESHOLD DECISION
+            contrast_score = np.std(sharpened) 
+            brightness = np.mean(sharpened)
+
+            if brightness < 120: # Dark Image
+                processed = cv2.adaptiveThreshold(
+                    sharpened,
+                    255,
+                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                    cv2.THRESH_BINARY,
+                    15, # block size
+                    3
+                )
+                logger.info("[PREPROCESS] Adaptive threshold applied")
+            elif contrast_score < 50:
+                _, processed = cv2.threshold(
+                    sharpened, 0, 255,
+                    cv2.THRESH_BINARY + cv2.THRESH_OTSU
+                )
+                logger.info("[PREPROCESS] Otsu threshold applied")
+
+            else:
+                processed = sharpened
+
+            # 9. MORPHOLOGY - Fill the small gaps and connect the characters
+            kernel = np.ones((2, 2), np.uint8)
+
+            processed = cv2.morphologyEx(
+                processed,
+                cv2.MORPH_CLOSE,
+                kernel
+            )
+
+            logger.info("[PREPROCESS] Morphology applied")
+
+            # ENCODING (LOSSLESS Compression)
+            success, encoded = cv2.imencode(".png", processed)
+
+            if not success:
+                raise ValueError("Encoding failed")
+            
+            end_time = time.time()
+            logger.info(f"[TIME] Preprocessing took {(end_time - start_time)*1000:.2f} ms")
+
+            return encoded.tobytes()
+
+        except Exception as e:
+            logger.warning(f"[PREPROCESS] Failed → fallback: {e}")
+            with open(image_path, "rb") as f:
+                return f.read()
+
+    # Retry Logic with Backoff - handle API failures, network issue, azure down
+    def _retry_analyze(self, image_bytes, retries=3, delay=2):
+        for attempt in range(retries):
+            try:
+                logger.info(f"[OCR] Attempt {attempt+1}")
+
+                poller = self.client.begin_analyze_document(
+                    "prebuilt-read", # prebuilt-read - Normal OCR (text extraction), prebuilt-layout - Layout + tables, prebuilt-invoice - Invoice parsing
+                    image_bytes
+                )
+                return poller.result(timeout=30)
+
+            except Exception as e:
+                logger.warning(f"Attempt {attempt+1} failed: {e}")
+
+                if attempt < retries - 1:
+                    if "429" in str(e):
+                        sleep_time = delay * (3 ** attempt)  # aggressive backoff
+                        logger.warning(f"Rate limit hit (429). Sleeping {sleep_time}s")
+
+                    else:
+                        sleep_time = delay * (2 ** attempt)  # normal backoff
+                        logger.info(f"Sleeping {sleep_time}s")
+
+                    time.sleep(sleep_time)
+                else:
+                    logger.error("All retries failed")
+                    raise
+
+    # Parse Result
+    def _parse_result(self, result):
+        if not result or not result.pages:
+            return "", 0.0
+
+        lines = []
+        confidences = []
+
+        for page in result.pages:
+            for line in getattr(page, "lines", []):
+                if line.content:
+                    lines.append(line.content)
+
+            for word in getattr(page, "words", []):
+                if word.confidence:
+                    confidences.append(word.confidence)
+
+        text = "\n".join(lines).strip()
+        avg_conf = sum(confidences) / len(confidences) if confidences else 0
+
+        return text, avg_conf
+
+    # Text Quality Score, check wheather text is meaningful or not
+    def _score_text(self, text):
+        words = text.split()
+        if not words:
+            return 0
+
+        valid = sum(1 for w in words if re.match(r'^[A-Za-z0-9.,:/@%-]+$', w)) # valid - "Hello", "OCR", "123" and  invalid - "!!"
+        avg_len = sum(len(w) for w in words) / len(words)
+        # ["Hello", "OCR", "123"]
+        # lengths = [5, 3, 3]
+        # avg_len = 11 / 3 = 3.67
+
+        return (valid * 2) + avg_len
+
+    # Main OCR
+    def extract_text(self, image_path: str) -> str:
+        try:
+            logger.info(f"Processing: {image_path}")
+            self._validate_file(image_path)
+
+            # RAW OCR
+            with open(image_path, "rb") as f:
+                raw_bytes = f.read()
+
+            raw_res = self._retry_analyze(raw_bytes)
+            raw_text, raw_conf = self._parse_result(raw_res)
+
+            # Early exit
+            if raw_conf > 0.85 and len(raw_text) > 30:
+                logger.info("[OCR] RAW good enough → skipping preprocessing")
+                return raw_text
+
+            # PROCESSED OCR
+            proc_bytes = self._preprocess_image(image_path)
+            proc_res = self._retry_analyze(proc_bytes)
+            proc_text, proc_conf = self._parse_result(proc_res)
+
+            # Hybrid scoring
+            raw_score = raw_conf * 0.7 + self._score_text(raw_text) * 0.3
+            proc_score = proc_conf * 0.7 + self._score_text(proc_text) * 0.3
+
+            final_text = raw_text if raw_score >= proc_score else proc_text
+
+            logger.info(f"[OCR] Selected {'RAW' if raw_score >= proc_score else 'PROCESSED'}")
+
+            return re.sub(r'\s+', ' ', final_text)
+
+        except FileNotFoundError as e:
+            logger.error(f"[FILE ERROR] {e}")
+            return ""
+
+        except ValueError as e:
+            logger.error(f"[VALIDATION ERROR] {e}")
+            return ""
+
+        except Exception as e:
+            logger.error(f"[OCR ERROR] Unexpected error: {e}")
+            return ""
+
+        finally:
+            logger.info("[OCR] Processing completed.")
+
+
+# Main
+if __name__ == "__main__":
+    try:
+        endpoint = os.getenv("AZURE_ENDPOINT")
+        key = os.getenv("AZURE_API_KEY")
+
+        if not endpoint or not key:
+            raise EnvironmentError("Missing Azure credentials")
+
+        ocr = AzureOCRProcessor(endpoint, key)
+
+        path = input("Enter image path: ").strip()
+        text = ocr.extract_text(path)
+
+        print("\n===== Extracted Text =====\n")
+        print(text if text else "No text found.")
+
+    except Exception as e:
+        logger.critical(f"[FATAL] Application failed: {e}")
+
+
